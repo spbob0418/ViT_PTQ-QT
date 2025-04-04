@@ -23,6 +23,7 @@ import numpy as np
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
+import torch.nn.functional as F
 
 import torch
 import torch.nn as nn
@@ -43,9 +44,13 @@ from timm.utils import ApexScaler, NativeScaler
 
 from data import create_loader, create_dataset
 from optim_factory import create_optimizer_v2, optimizer_kwargs
+from token_probe import eval_probe
+from checkpointSaver import CheckpointSaver
 
-from models import vision_transformer, swin_transformer, convnext, as_mlp
+from models import quant_vision_transformer_CushionCache, vision_transformer, swin_transformer, convnext, as_mlp
 
+from transformers import ViTModel
+from rename_key import rename_keys
 
 import ipdb
 
@@ -81,6 +86,22 @@ parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
 
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+#ViT QFT parameters 
+parser.add_argument('--register-num', default=0, type=int)
+parser.add_argument('--sample-data-path', type=str)
+parser.add_argument('--sample-eval', action='store_true')
+parser.add_argument('--prompt-search-mode',action='store_true')
+parser.add_argument('--save-cp-point', type=int, nargs='+', help='List of checkpoints (as integers) to save')
+parser.add_argument('--a-quant-type', default='None', type=str)
+parser.add_argument('--ag-quant-type', default='None', type=str)
+parser.add_argument('--resume-mode', default='None', type=str)
+parser.add_argument('--freeze-reg',action='store_true')
+parser.add_argument('--save-custom-cp',action='store_true')
+parser.add_argument('--save-best-cp',action='store_true')
+
+# parser.add_argument('--prompt-search-mode-with-custom-loss', action='store_true')
+# parser.add_argument('--loss-mode', default='None', type=str) #mean, sum
+# parser.add_argument('--accum-step', default='1', type=int)
 
 # Dataset parameters
 parser.add_argument('data_dir', metavar='DIR',
@@ -299,7 +320,7 @@ parser.add_argument('--log-interval', type=int, default=50, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
-parser.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
+parser.add_argument('--checkpoint-hist', type=int, default=1, metavar='N',
                     help='number of checkpoints to keep (default: 10)')
 parser.add_argument('-j', '--workers', type=int, default=8, metavar='N',
                     help='how many training processes to use (default: 4)')
@@ -400,20 +421,152 @@ def main():
     if args.fuser:
         set_jit_fuser(args.fuser)
 
-    model = create_model(
-        args.model,
-        pretrained=args.pretrained,
-        num_classes=args.num_classes,
-        drop_rate=args.drop,
-        drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
-        drop_path_rate=args.drop_path,
-        drop_block_rate=args.drop_block,
-        global_pool=args.gp,
-        bn_momentum=args.bn_momentum,
-        bn_eps=args.bn_eps,
-        scriptable=args.torchscript,
-        checkpoint_path=args.initial_checkpoint,
-        tuning_mode=args.tuning_mode)
+    if args.prompt_search_mode or args.resume_mode: 
+        model = create_model(
+            args.model,
+            a_quant_type = args.a_quant_type,
+            ag_quant_type = args.ag_quant_type,
+            register_num = args.register_num,
+            num_classes=args.num_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            drop_block_rate=None,
+            img_size=args.input_size, 
+        )
+    else:
+        model = create_model(
+            args.model,
+            pretrained=args.pretrained,
+            num_classes=args.num_classes,
+            drop_rate=args.drop,
+            drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
+            drop_path_rate=args.drop_path,
+            drop_block_rate=args.drop_block,
+            global_pool=args.gp,
+            bn_momentum=args.bn_momentum,
+            bn_eps=args.bn_eps,
+            scriptable=args.torchscript,
+            checkpoint_path=args.initial_checkpoint,
+            tuning_mode=args.tuning_mode)
+
+    #################################################
+    # if args.prompt_search_mode:
+    #     c_model = create_model("vit_base_patch16_224", pretrained=True)
+
+    #     # 모델의 가중치(state_dict) 가져오기    
+    #     checkpoint = c_model.state_dict()
+
+    #     new_checkpoint = {}
+    #     for key, value in checkpoint.items():
+    #         new_key = key.replace('blocks', 'blocks.modules_list')
+    #         new_checkpoint[new_key] = value
+
+    #     for key in list(new_checkpoint.keys()):
+    #         if 'head.bias' in key or 'head.weight' in key:
+    #             del new_checkpoint[key]
+
+    #     pos_embed_checkpoint = new_checkpoint['pos_embed']
+    #     embedding_size = pos_embed_checkpoint.shape[-1]
+
+    #     old_num_extra_tokens = 1
+    #     new_num_extra_tokens = 1 + args.register_num  
+
+    #     old_cls_token = pos_embed_checkpoint[:, :old_num_extra_tokens, :]   
+    #     old_patch_tokens = pos_embed_checkpoint[:, old_num_extra_tokens:, :] 
+        
+    #     with torch.no_grad():
+    #         extra_tokens_from_model = model.pos_embed[:, old_num_extra_tokens:new_num_extra_tokens, :]
+
+    #     num_patches = model.patch_embed.num_patches #576
+
+    #     orig_size = int((old_patch_tokens.shape[1]) ** 0.5)  
+    #     new_size = int(num_patches ** 0.5)               
+
+    #     patch_tokens_2d = old_patch_tokens.reshape(1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+    #     patch_tokens_2d = F.interpolate(patch_tokens_2d, size=(new_size, new_size), mode='bicubic', align_corners=False)
+    #     patch_tokens_interp = patch_tokens_2d.permute(0, 2, 3, 1).flatten(1, 2) 
+
+    #     new_pos_embed = torch.cat(
+    #         [old_cls_token, extra_tokens_from_model, patch_tokens_interp],
+    #         dim=1
+    #     )
+    #     new_checkpoint['pos_embed'] = new_pos_embed
+    #     model.load_state_dict(new_checkpoint, strict=False)
+
+    if args.prompt_search_mode:
+        checkpoint = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k').state_dict()
+
+
+        key_mapping, qkv_weights, qkv_biases = rename_keys(checkpoint, True)
+
+        new_checkpoint = {}
+
+        for old_key, new_key in key_mapping.items():
+            if new_key in model.state_dict():
+                new_checkpoint[new_key] = checkpoint[old_key]
+
+        for layer_num in qkv_weights.keys():
+            if "query" in qkv_weights[layer_num] and "key" in qkv_weights[layer_num] and "value" in qkv_weights[layer_num]:
+                qkv_weight = torch.cat([
+                    qkv_weights[layer_num]["query"],
+                    qkv_weights[layer_num]["key"],
+                    qkv_weights[layer_num]["value"]
+                ], dim=0)
+                new_checkpoint[f"blocks.modules_list.{layer_num}.attn.qkv.weight"] = qkv_weight
+
+        for layer_num in qkv_biases.keys():
+            if "query" in qkv_biases[layer_num] and "key" in qkv_biases[layer_num] and "value" in qkv_biases[layer_num]:
+                qkv_bias = torch.cat([
+                    qkv_biases[layer_num]["query"],
+                    qkv_biases[layer_num]["key"],
+                    qkv_biases[layer_num]["value"]
+                ], dim=0)
+                new_checkpoint[f"blocks.modules_list.{layer_num}.attn.qkv.bias"] = qkv_bias
+
+        pos_embed_checkpoint = new_checkpoint['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1]
+
+        old_num_extra_tokens = 1
+        new_num_extra_tokens = 1 + args.register_num  
+
+        old_cls_token = pos_embed_checkpoint[:, :old_num_extra_tokens, :]   
+        old_patch_tokens = pos_embed_checkpoint[:, old_num_extra_tokens:, :] 
+        
+        with torch.no_grad():
+            extra_tokens_from_model = model.pos_embed[:, old_num_extra_tokens:new_num_extra_tokens, :]
+
+        num_patches = model.patch_embed.num_patches #576
+
+        orig_size = int((old_patch_tokens.shape[1]) ** 0.5)  
+        new_size = int(num_patches ** 0.5)               
+
+        patch_tokens_2d = old_patch_tokens.reshape(1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+        patch_tokens_2d = F.interpolate(patch_tokens_2d, size=(new_size, new_size), mode='bicubic', align_corners=False)
+        patch_tokens_interp = patch_tokens_2d.permute(0, 2, 3, 1).flatten(1, 2) 
+
+        new_pos_embed = torch.cat(
+            [old_cls_token, extra_tokens_from_model, patch_tokens_interp],
+            dim=1
+        )
+        new_checkpoint['pos_embed'] = new_pos_embed
+        model.load_state_dict(new_checkpoint, strict=False)
+
+        model_keys = set(model.state_dict().keys())
+        checkpoint_keys = set(new_checkpoint.keys())
+
+        # 완전히 일치 여부 확인
+        if model_keys == checkpoint_keys:
+            print("✅ new_checkpoint와 model.state_dict()의 키가 완벽히 일치합니다!")
+        else:
+            print("❌ 키 불일치 발견!")
+            print(f"모델에 있는데 체크포인트에 없는 키: {model_keys - checkpoint_keys}")
+            print(f"체크포인트에 있는데 모델에 없는 키: {checkpoint_keys - model_keys}")
+
+    if args.resume_mode != 'None': 
+        checkpoint = torch.load(args.resume_mode, map_location="cpu")
+        # checkpoint['state_dict'] = {k: v for k, v in checkpoint['state_dict'].items() if not k.startswith("head.")}
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
+
 
     
     if args.num_classes is None:
@@ -511,11 +664,11 @@ def main():
             # Apex DDP preferred unless native amp is activated
             if args.local_rank == 0:
                 _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True)
+            model = ApexDDP(model, delay_allreduce=True,  find_unused_parameters=True)
         else:
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
+            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb,  find_unused_parameters=True)
         # NOTE: EMA model does not need to be wrapped by DDP
 
     # setup learning rate schedule and starting epoch
@@ -666,6 +819,7 @@ def main():
             distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
         eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+        
 
         if model_ema is not None and not args.model_ema_force_cpu:
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -673,18 +827,33 @@ def main():
             ema_eval_metrics = validate(
                 model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, log_suffix=' (EMA)')
             eval_metrics = ema_eval_metrics
-        if saver is not None:
-            # save proper checkpoint with eval metric
-            save_metric = eval_metrics[eval_metric]
-            best_metric, best_epoch = saver.save_checkpoint(start_epoch, metric=save_metric)
+            
+        # if args.save_best_cp:
+        #     save_metric = eval_metrics[eval_metric]
+        #     best_metric, best_epoch = saver.save_best_checkpoint(start_epoch, metric=save_metric)
+            
+        # if args.save_custom_cp and epoch in args.save_cp_point:
+        #     # save proper checkpoint with eval metric
+        #     save_metric = eval_metrics[eval_metric]
+        #     saver.save_checkpoint(start_epoch, metric=save_metric)
 
         return
         
     try:
+        for name, param in model.named_parameters():
+            param.requires_grad = True
+            if args.freeze_reg:
+                if name == 'module.reg_token':
+                    param.requires_grad = False
+
+        print("freezed param")
+        for name, param in model.named_parameters():
+            if param.requires_grad == False:
+                print(name)
+
         for epoch in range(start_epoch, num_epochs):
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
-
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
@@ -712,11 +881,15 @@ def main():
                 update_summary(
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
-
             if saver is not None:
-                # save proper checkpoint with eval metric
+                # print(args.save_cp_point)
                 save_metric = eval_metrics[eval_metric]
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+                best_metric, best_epoch = saver.save_best_checkpoint(epoch, metric=save_metric)
+                if args.save_cp_point is not None:
+                    if epoch in args.save_cp_point:
+                        print("save_CP")
+                        save_metric = eval_metrics[eval_metric]
+                        saver.save_checkpoint(epoch, metric=save_metric)
 
     except KeyboardInterrupt:
         pass
@@ -756,11 +929,17 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output = model(input)
+            output = model(input, epoch = epoch, iteration = batch_idx, device_id=args.device)
+            # if batch_idx == 0 and args.device == 0: 
+            #     hidden_state = model(input, is_index_eval = True, epoch = epoch, iteration = batch_idx, 
+            #                device_id=args.device)
+            #     std, max = eval_probe(hidden_state, args.register_num, block_num=11, epoch=epoch)
             loss = loss_fn(output, target)
+
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
+
 
         optimizer.zero_grad()
         if loss_scaler is not None:

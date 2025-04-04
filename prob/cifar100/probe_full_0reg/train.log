@@ -1,0 +1,20 @@
+Training with a single process on 1 GPUs.
+Data processing configuration for current model + dataset:
+	input_size: (3, 224, 224)
+	interpolation: bicubic
+	mean: (0.5, 0.5, 0.5)
+	std: (0.5, 0.5, 0.5)
+	crop_pct: 0.9
+Model fullbits_vit_base_patch16_224 created, param count:85887844
+number of params for requires grad: 85887844
+AMP not enabled. Training in float32.
+Restoring model state from checkpoint...
+Restoring optimizer state from checkpoint...
+Loaded checkpoint '/home/shkim/SSF_org/SSF/output/fullbits_vit_base_patch16_224/cifar100/full_8reg_32_4e_4_for_last_checkpoint/fullbits_vit_base_patch16_224-full_8reg_32_4e_4_for_last_checkpoint/8reg_with_4e-4LR_32BS_110Epoch.tar' (epoch 109)
+Loaded state_dict_ema from checkpoint '/home/shkim/SSF_org/SSF/output/fullbits_vit_base_patch16_224/cifar100/full_8reg_32_4e_4_for_last_checkpoint/fullbits_vit_base_patch16_224-full_8reg_32_4e_4_for_last_checkpoint/8reg_with_4e-4LR_32BS_110Epoch.tar'
+Scheduled epochs: 110
+torch.Size([205])
+torch.Size([205])
+torch.Size([205])
+torch.Size([205])
+torch.Size([205])

@@ -19,8 +19,8 @@ cd SSF
 - Create a conda virtual environment and activate it:
 
 ```bash
-conda create -n ssf python=3.7 -y
-conda activate ssf
+conda create -n ssf_org python=3.7 -y
+conda activate ssf_org
 ```
 
 - Install `CUDA==10.1` with `cudnn7` following
@@ -29,6 +29,7 @@ conda activate ssf
 
 ```bash
 conda install pytorch==1.7.1 torchvision==0.8.2 cudatoolkit=10.1 -c pytorch
+conda install pytorch==1.7.1 torchvision==0.8.2 torchaudio==0.7.2 cudatoolkit=11.0 -c pytorch 
 ```
 
 - Install `timm==0.6.5`:
