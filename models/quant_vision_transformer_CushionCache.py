@@ -208,8 +208,9 @@ class _quantize_global(torch.autograd.Function):
             a_g_qmodule = ctx.a_g_qmodule
             w_g_qmodule = ctx.w_g_qmodule
             a_g_2D_quant, a_s_g_2D_quant = a_g_qmodule(g_2D)
-            w_g_2D_quant, w_s_g_2D_quant = w_g_qmodule(g_2D)
+            
             if w_g_qmodule.N_bits is not None:
+                w_g_2D_quant, w_s_g_2D_quant = w_g_qmodule(g_2D)
                 (q_x, s_x) = ctx.activation
             else:
                 x = ctx.activation

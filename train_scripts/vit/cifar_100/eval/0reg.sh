@@ -19,7 +19,6 @@ nohup bash -c "CUDA_VISIBLE_DEVICES=4,5,6,7 python -m torch.distributed.launch -
 	--register-num 8 \
 	--a-quant-type per_token \
 	--evaluate \
-	--resume /home/shkim/SSF_org/SSF/output/fullbits_vit_base_patch16_224/cifar100/full_8reg_32_4e_4_for_last_checkpoint/fullbits_vit_base_patch16_224-full_8reg_32_4e_4_for_last_checkpoint/checkpoint-92.pth.tar \
 	--pretrained" > ${DIR}/output/${MODEL}/cifar100/eval/${VERSION}/train.log 2>&1 &
 
 

@@ -26,7 +26,6 @@ from datetime import datetime
 import torch.nn.functional as F
 import math
 from torch.optim.lr_scheduler import _LRScheduler
-import random
 
 import torch
 import torch.nn as nn
@@ -377,62 +376,8 @@ def _parse_args():
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
-
-class WarmupCosineConcatScheduler(_LRScheduler):
-    def __init__(self, optimizer, warmup_epochs, warmup_lr, transition_epoch, total_epochs,
-                 base_lr_1, base_lr_2, min_lr=0.0, last_epoch=-1,
-                 lr_noise=None, lr_noise_pct=0.67, lr_noise_std=1.0):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.transition_epoch = transition_epoch
-        self.total_epochs = total_epochs
-        self.base_lr_1 = base_lr_1
-        self.base_lr_2 = base_lr_2
-        self.warmup_lr = warmup_lr
-        self.min_lr = min_lr
-        self._step_update_called = False
-        self.num_updates = 0
-
-        # Noise 관련 인자
-        self.lr_noise = lr_noise  # e.g., [0.6, 0.9]
-        self.lr_noise_pct = lr_noise_pct
-        self.lr_noise_std = lr_noise_std
-
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        return self._compute_lr(self.last_epoch)
-
-    def step(self, epoch=None):
-        self._step_update_called = False
-        super().step(epoch)
-
-    def _apply_noise(self, lr, epoch):
-        if self.lr_noise is None:
-            return lr
-        noise_range = [int(self.total_epochs * p) for p in self.lr_noise]
-        if not (noise_range[0] <= epoch <= noise_range[1]):
-            return lr
-        noise = random.gauss(0, self.lr_noise_std)
-        noise *= self.lr_noise_pct  # e.g., ±67%
-        return lr * (1 + noise)
-
-    def _compute_lr(self, epoch):
-        if epoch < self.warmup_epochs:
-            warmup_factor = epoch / self.warmup_epochs
-            lr = max(self.base_lr_1 * warmup_factor, self.warmup_lr)
-        elif epoch < self.transition_epoch:
-            t = epoch - self.warmup_epochs
-            T = self.total_epochs - self.warmup_epochs
-            lr = self.min_lr + (self.base_lr_1 - self.min_lr) * 0.5 * (1 + math.cos(math.pi * t / T))
-        elif epoch < self.total_epochs:
-            t = epoch - self.warmup_epochs
-            T = self.total_epochs - self.warmup_epochs
-            lr = self.min_lr + (self.base_lr_2 - self.min_lr) * 0.5 * (1 + math.cos(math.pi * t / T))
-
-        noisy_lr = self._apply_noise(lr, epoch)
-        return [noisy_lr for _ in self.optimizer.param_groups]
-
+# import math
+# from torch.optim.lr_scheduler import _LRScheduler
 
 # class WarmupCosineConcatScheduler(_LRScheduler):
 #     def __init__(self, optimizer, warmup_epochs, warmup_lr, transition_epoch, total_epochs,
@@ -648,9 +593,8 @@ def main():
         assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
         ps_model = torch.jit.script(ps_model)
 
-    optimizer = create_optimizer_v2(ps_model, **optimizer_kwargs(cfg=args))
-    optimizer.step()
-    # qft_optimizer = create_optimizer_v2(qft_model, **optimizer_kwargs(cfg=args))
+    ps_optimizer = create_optimizer_v2(ps_model, **optimizer_kwargs(cfg=args))
+    qft_optimizer = create_optimizer_v2(qft_model, **optimizer_kwargs(cfg=args))
 
     if args.local_rank == 0:
         _logger.info(
@@ -695,6 +639,19 @@ def main():
                 _logger.info("Using native Torch DistributedDataParallel.")
             ps_model = NativeDDP(ps_model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb,  find_unused_parameters=True)
         # NOTE: EMA model does not need to be wrapped by DDP
+
+
+    args.lr = args.prompt_searching_lr
+    ps_lr_scheduler, num_epochs = create_scheduler(args, ps_optimizer)
+    if ps_lr_scheduler is not None:
+        ps_lr_scheduler.step(0)
+
+
+    args.lr = args.qft_lr
+    qft_lr_scheduler, num_epochs = create_scheduler(args, qft_optimizer)
+    if qft_lr_scheduler is not None:
+        qft_lr_scheduler.step(args.prompt_search_epoch)
+ 
 
     if args.local_rank == 0:
         _logger.info('Scheduled epochs: {}'.format(args.epochs))
@@ -781,20 +738,18 @@ def main():
         pin_memory=args.pin_mem,
     )
 
-    lr_scheduler = WarmupCosineConcatScheduler(
-        optimizer,
-        warmup_epochs=args.warmup_epochs,
-        warmup_lr=args.warmup_lr,
-        transition_epoch=args.prompt_search_epoch,
-        total_epochs=args.epochs,
-        base_lr_1=args.prompt_searching_lr,
-        base_lr_2=args.qft_lr,
-        min_lr=args.min_lr,
-        lr_noise=args.lr_noise,        # 전체 epoch 중 40% ~ 80% 사이에만 노이즈 적용
-        lr_noise_pct=args.lr_noise_pct,          # ±67%
-        lr_noise_std=args.lr_noise_std           # 정규분포 std
-    )
-    lr_scheduler.step(0)
+    # lr_scheduler = WarmupCosineConcatScheduler(
+    #     optimizer,
+    #     warmup_epochs=10,
+    #     warmup_lr =args.warmup_lr,
+    #     transition_epoch=args.prompt_search_epoch,
+    #     total_epochs=args.epochs,
+    #     base_lr_1=args.prompt_searching_lr,
+    #     base_lr_2=args.qft_lr,
+    #     min_lr=args.min_lr,
+    #     iters_per_epoch=len(loader_train),  # 필수!
+    # )
+    # lr_scheduler.step(0)
 
     # setup loss function
     if args.jsd_loss:
@@ -835,7 +790,7 @@ def main():
         decreasing = True if eval_metric == 'loss' else False
         args.model = args.qft_model
         saver = CheckpointSaver(
-            model=qft_model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
+            model=qft_model, optimizer=qft_optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
             checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
@@ -872,8 +827,8 @@ def main():
         if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
             loader_train.sampler.set_epoch(epoch)
         train_metrics = train_one_epoch(
-            epoch, ps_model, loader_train, optimizer, train_loss_fn, args,
-            lr_scheduler=lr_scheduler, saver=None, output_dir=output_dir,
+            epoch, ps_model, loader_train, ps_optimizer, train_loss_fn, args,
+            lr_scheduler=ps_lr_scheduler, saver=None, output_dir=output_dir,
             amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
         if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
             if args.local_rank == 0:
@@ -889,8 +844,8 @@ def main():
                 model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, log_suffix=' (EMA)')
             eval_metrics = ema_eval_metrics
 
-        if lr_scheduler is not None:
-            lr_scheduler.step(epoch + 1)
+        if ps_lr_scheduler is not None:
+            ps_lr_scheduler.step(epoch + 1)
 
         if output_dir is not None:
             update_summary(
@@ -936,8 +891,8 @@ def main():
         if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
             loader_train.sampler.set_epoch(epoch)
         train_metrics = train_one_epoch(
-            epoch, qft_model, loader_train, optimizer, train_loss_fn, args,
-            lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
+            epoch, qft_model, loader_train, qft_optimizer, train_loss_fn, args,
+            lr_scheduler=qft_lr_scheduler, saver=saver, output_dir=output_dir,
             amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
 
         if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -954,9 +909,9 @@ def main():
                 model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, log_suffix=' (EMA)')
             eval_metrics = ema_eval_metrics
 
-        if lr_scheduler is not None:
+        if qft_lr_scheduler is not None:
             # step LR for next epoch
-            lr_scheduler.step(epoch + 1)
+            qft_lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
         if output_dir is not None:
             update_summary(
@@ -1074,7 +1029,7 @@ def train_one_epoch(
                         os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
                         padding=0,
                         normalize=True)
-        torch.cuda.empty_cache()
+
         if saver is not None and args.recovery_interval and (
                 last_batch or (batch_idx + 1) % args.recovery_interval == 0):
             saver.save_recovery(epoch, batch_idx=batch_idx)
@@ -1134,7 +1089,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 reduced_loss = loss.data
 
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
 
             losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))
