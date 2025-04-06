@@ -1,7 +1,7 @@
 
 
 DIR=/home/shkim/SSF_org/SSF
-VERSION=8reg_ps4e-4_20_qft5e-5
+VERSION=8reg_ps8e-4_20_qft5e-5
 MODEL=ps_qft
 
 export DIR VERSION MODEL
@@ -21,9 +21,10 @@ nohup bash -c "CUDA_VISIBLE_DEVICES=4,5,6,7 python -m torch.distributed.launch -
 	--log-wandb --experiment ${VERSION} \
 	--register-num 8 \
 	--ps-model fullbits_vit_base_patch16_224 \
-	--prompt-searching-lr 4e-4 \
+	--prompt-searching-lr 8e-4 \
 	--qft-model eightbits_vit_base_patch16_224 \
 	--qft-lr 5e-5 \
+	--freeze-reg \
 	--prompt-search-epoch 20 \
 	--a-quant-type per_tensor \
 	--ag-quant-type per_tensor" > ${DIR}/output/${MODEL}/cifar100/${VERSION}/train.log 2>&1 &
